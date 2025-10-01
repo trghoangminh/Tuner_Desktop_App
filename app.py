@@ -44,15 +44,18 @@ class TunerGauge(QtWidgets.QWidget):
         self.status_text = ""
         self.tooltip_text = ""
         self._ema_cents = float("nan")
-        self._ema_alpha = 0.25
+        self._ema_alpha = 0.18
         # Hysteresis + debounce for status stability
         self._status: str = ""
         self._pending_status: Optional[str] = None
         self._pending_since_s: float = 0.0
         self._debounce_s: float = 0.15  # 150 ms to confirm status change
-        self._hyst_in_cents: float = 3.0
-        self._hyst_out_cents: float = 6.0
-        self.setMinimumSize(560, 280)
+        # Enter in-tune within ±2 cents; exit when beyond ±4 cents
+        self._hyst_in_cents: float = 2.0
+        self._hyst_out_cents: float = 4.0
+        self.setMinimumSize(560, 320)
+        self._last_f0_hz: float = 0.0
+        self._last_cents_off: float = float("nan")
 
     def setReadingState(self, state: PitchState):
         self.note = state.note or state.target_note or ""
@@ -74,6 +77,8 @@ class TunerGauge(QtWidgets.QWidget):
         else:
             self.tooltip_text = ""
         self.setToolTip(self.tooltip_text)
+        self._last_f0_hz = state.f0_hz
+        self._last_cents_off = raw_cents if isinstance(raw_cents, float) else float("nan")
         self.update()
 
     def _update_status(self, raw_cents: float) -> str:
@@ -87,7 +92,7 @@ class TunerGauge(QtWidgets.QWidget):
         if self._status == "In tune":
             # Stay in tune until we exit wider band
             if abs(raw_cents) > self._hyst_out_cents:
-                candidate = "Tune up" if raw_cents > 0 else "Tune down"
+                candidate = "Tune up" if raw_cents < 0 else "Tune down"
             else:
                 candidate = "In tune"
         else:
@@ -95,7 +100,7 @@ class TunerGauge(QtWidgets.QWidget):
             if abs(raw_cents) < self._hyst_in_cents:
                 candidate = "In tune"
             else:
-                candidate = ("Tune up" if raw_cents > 0 else "Tune down")
+                candidate = ("Tune up" if raw_cents < 0 else "Tune down")
         if candidate != self._status:
             if self._pending_status != candidate:
                 self._pending_status = candidate
@@ -115,7 +120,7 @@ class TunerGauge(QtWidgets.QWidget):
         elif mode_l == "median":
             self._ema_alpha = 0.2  # keep EMA mild; backend median handles most smoothing
         else:  # ema
-            self._ema_alpha = 0.25
+            self._ema_alpha = 0.18
 
     def paintEvent(self, event: QtGui.QPaintEvent):
         p = QtGui.QPainter(self)
@@ -123,9 +128,12 @@ class TunerGauge(QtWidgets.QWidget):
             p.setRenderHint(QtGui.QPainter.Antialiasing)
             rect = self.rect()
 
+            # Dark background
+            p.fillRect(rect, QtGui.QColor("#121417"))
+
             # Gauge arc
-            cx, cy = rect.center().x(), rect.bottom() - 20
-            radius = min(rect.width() // 2 - 40, 160)
+            cx, cy = rect.center().x(), rect.bottom() - 36
+            radius = min(rect.width() // 2 - 60, 170)
             start_angle = 200  # degrees
             end_angle = -20
 
@@ -163,13 +171,22 @@ class TunerGauge(QtWidgets.QWidget):
 
                 grad = QtGui.QLinearGradient(p2, p3)
                 grad.setColorAt(0.0, QtGui.QColor("#EF4444"))
-                grad.setColorAt(0.33, QtGui.QColor("#F97316"))
+                grad.setColorAt(0.33, QtGui.QColor("#F59E0B"))
                 grad.setColorAt(0.66, QtGui.QColor("#F59E0B"))
                 grad.setColorAt(1.0, QtGui.QColor("#22C55E"))
                 p.fillPath(path, QtGui.QBrush(grad))
 
-            # Note text
-            font = QtGui.QFont("Inter", 108)
+            # Status glow when in tune (subtle on dark)
+            if self.status_text == "In tune":
+                glow_rect = QtCore.QRectF(0, cy - radius - 40, rect.width(), radius + 60)
+                grad = QtGui.QLinearGradient(glow_rect.topLeft(), glow_rect.bottomLeft())
+                grad.setColorAt(0.0, QtGui.QColor(34, 197, 94, 0))
+                grad.setColorAt(0.5, QtGui.QColor(34, 197, 94, 50))
+                grad.setColorAt(1.0, QtGui.QColor(34, 197, 94, 0))
+                p.fillRect(glow_rect, QtGui.QBrush(grad))
+
+            # Note text (big)
+            font = QtGui.QFont("Roboto", 108)
             try:
                 font.setWeight(QtGui.QFont.Weight.DemiBold)
             except AttributeError:
@@ -180,8 +197,8 @@ class TunerGauge(QtWidgets.QWidget):
             p.setPen(QtGui.QPen(QtGui.QColor("#EDEFF2")))
             p.drawText(QtCore.QRectF(0, cy - radius + 20, rect.width(), 100), QtCore.Qt.AlignCenter, self.note or "")
 
-            # Status
-            small = QtGui.QFont("Inter", 18)
+            # Status + meta
+            small = QtGui.QFont("Roboto", 18)
             p.setFont(small)
             # Color by status
             if self.status_text == "In tune":
@@ -189,11 +206,20 @@ class TunerGauge(QtWidgets.QWidget):
             elif self.status_text == "Tune up":
                 status_color = QtGui.QColor("#F59E0B")
             elif self.status_text == "Tune down":
-                status_color = QtGui.QColor("#F97316")
+                status_color = QtGui.QColor("#EF4444")
             else:
-                status_color = QtGui.QColor("#A9B0BB")
+                status_color = QtGui.QColor("#6B7280")
             p.setPen(QtGui.QPen(status_color))
-            p.drawText(QtCore.QRectF(0, cy - radius + 110, rect.width(), 40), QtCore.Qt.AlignCenter, self.status_text)
+            p.drawText(QtCore.QRectF(0, cy - radius + 110, rect.width(), 28), QtCore.Qt.AlignCenter, self.status_text)
+
+            meta = QtGui.QFont("Roboto", 16)
+            p.setFont(meta)
+            p.setPen(QtGui.QPen(QtGui.QColor("#EDEFF2")))
+            hz_text = f"{self._last_f0_hz:.2f} Hz" if self._last_f0_hz > 0 else "0.00 Hz"
+            cents_text = (f"{self._last_cents_off:+.1f} cents" if isinstance(self._last_cents_off, float) and not math.isnan(self._last_cents_off) else "")
+            p.drawText(QtCore.QRectF(0, cy - radius + 142, rect.width(), 26), QtCore.Qt.AlignCenter, hz_text)
+            p.setPen(QtGui.QPen(QtGui.QColor("#A9B0BB")))
+            p.drawText(QtCore.QRectF(0, cy - radius + 168, rect.width(), 24), QtCore.Qt.AlignCenter, cents_text)
         finally:
             p.end()
 
@@ -301,7 +327,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_string_chips(["E2","A2","D3","G3","B3","E4"])  # default guitar
 
         leftCol = QtWidgets.QVBoxLayout()
-        leftCol.addWidget(QtWidgets.QLabel("Instrument preset"))
+        lblPreset = QtWidgets.QLabel("Nhạc cụ")
+        leftCol.addWidget(lblPreset)
         leftCol.addWidget(self.presetBox)
         leftCol.addWidget(self.stringChipsWrap)
         leftCol.addStretch(1)
@@ -313,52 +340,74 @@ class MainWindow(QtWidgets.QMainWindow):
         centerCol.addWidget(self.gauge, 1)
         centerCol.addStretch(1)
 
-        # Right: Control Bar (Start/Stop, Input, A4, Algo, Smooth, Chromatic)
-        self.startBtn = QtWidgets.QPushButton("Start")
-        self.stopBtn = QtWidgets.QPushButton("Stop")
+        # Right: Control Bar (Start/Stop, A4, Algo, Smooth, Chromatic)
+        self.startBtn = QtWidgets.QPushButton("Bắt đầu")
+        self.startBtn.setObjectName("primary")
+        self.stopBtn = QtWidgets.QPushButton("Dừng")
         self.stopBtn.setEnabled(False)
-        self.inputDevice = QtWidgets.QComboBox()
-        self.inputLevel = QtWidgets.QProgressBar()
-        self.inputLevel.setRange(0, 100)
-        self.inputLevel.setTextVisible(False)
-        self._pending_input_level = 0
         self.a4Box = QtWidgets.QComboBox()
         self.a4Box.addItems(["440","442"]) 
         self.algoBox = QtWidgets.QComboBox()
         self.algoBox.addItems(["acf","yin"]) 
         self.smoothBox = QtWidgets.QComboBox()
         self.smoothBox.addItems(["none","ema","median"]) 
-        self.chromaticCheck = QtWidgets.QCheckBox("Chromatic")
+        self.chromaticCheck = QtWidgets.QCheckBox("Chế độ chromatic")
 
         rightCol = QtWidgets.QVBoxLayout()
-        rightCol.addWidget(QtWidgets.QLabel("Control"))
+        rightCol.addWidget(QtWidgets.QLabel("Điều khiển"))
         rightCol.addWidget(self.startBtn)
         rightCol.addWidget(self.stopBtn)
         rightCol.addSpacing(8)
-        rightCol.addWidget(QtWidgets.QLabel("Input device"))
-        rightCol.addWidget(self.inputDevice)
-        rightCol.addWidget(self.inputLevel)
-        rightCol.addSpacing(8)
         rightCol.addWidget(QtWidgets.QLabel("A4"))
         rightCol.addWidget(self.a4Box)
-        rightCol.addWidget(QtWidgets.QLabel("Algorithm"))
+        rightCol.addWidget(QtWidgets.QLabel("Thuật toán"))
         rightCol.addWidget(self.algoBox)
-        rightCol.addWidget(QtWidgets.QLabel("Smoothing"))
+        rightCol.addWidget(QtWidgets.QLabel("Làm mượt"))
         rightCol.addWidget(self.smoothBox)
         rightCol.addWidget(self.chromaticCheck)
         rightCol.addStretch(1)
 
-        # Main layout: left | center | right
-        main = QtWidgets.QHBoxLayout()
-        leftWrap = QtWidgets.QWidget(); leftWrap.setLayout(leftCol)
+        # Header bar (move preset & chips to top)
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Tuner")
+        title.setObjectName("title")
+        header.addWidget(title)
+        header.addSpacing(16)
+        header.addWidget(lblPreset)
+        header.addWidget(self.presetBox)
+        header.addWidget(self.stringChipsWrap, 1)
+        header.addStretch(1)
+
+        # Content: left | center | right
+        content = QtWidgets.QHBoxLayout()
+        self.leftWrap = QtWidgets.QWidget(); self.leftWrap.setLayout(leftCol)
         centerWrap = QtWidgets.QWidget(); centerWrap.setLayout(centerCol)
-        rightWrap = QtWidgets.QWidget(); rightWrap.setLayout(rightCol)
-        main.addWidget(leftWrap, 0)
-        main.addWidget(centerWrap, 1)
-        main.addWidget(rightWrap, 0)
+        self.rightWrap = QtWidgets.QWidget(); self.rightWrap.setLayout(rightCol)
+        content.addWidget(self.leftWrap, 0)
+        content.addWidget(centerWrap, 1)
+        content.addWidget(self.rightWrap, 0)
+
+        # Footer: input device + level meter
+        self.inputDevice = QtWidgets.QComboBox()
+        self.inputLevel = QtWidgets.QProgressBar()
+        self.inputLevel.setRange(0, 100)
+        self.inputLevel.setTextVisible(False)
+        self._pending_input_level = 0
+        footer = QtWidgets.QHBoxLayout()
+        footer.addWidget(QtWidgets.QLabel("Thiết bị vào"))
+        footer.addWidget(self.inputDevice, 1)
+        footer.addSpacing(8)
+        footer.addWidget(QtWidgets.QLabel("Mức tín hiệu"))
+        footer.addWidget(self.inputLevel)
 
         w = QtWidgets.QWidget()
-        w.setLayout(main)
+        outer = QtWidgets.QVBoxLayout()
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(12)
+        outer.addLayout(header)
+        outer.addLayout(content, 1)
+        outer.addLayout(footer)
+        w.setLayout(outer)
         self.setCentralWidget(w)
 
         self._stream: Optional[sd.InputStream] = None
@@ -372,6 +421,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.algoBox.currentTextChanged.connect(self.on_algo_changed)
         self.smoothBox.currentTextChanged.connect(self.on_smooth_changed)
         self.chromaticCheck.stateChanged.connect(self.on_chromatic_changed)
+        self.inputDevice.currentIndexChanged.connect(self.on_input_device_changed)
 
         # UI thread timer to apply input level safely
         self._level_timer = QtCore.QTimer(self)
@@ -381,6 +431,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Apply dark theme + QSS
         self.apply_theme()
+        # Populate devices after theme to avoid layout jank
+        self.populate_input_devices()
 
     def _build_string_chips(self, strings: List[str]):
         # Clear
@@ -390,9 +442,25 @@ class MainWindow(QtWidgets.QMainWindow):
         for s in strings:
             btn = QtWidgets.QPushButton(s)
             btn.setCheckable(True)
+            btn.setProperty("class", "chip")
             btn.clicked.connect(lambda checked, name=s: self.on_string_selected(checked, name))
             self.stringChipsLayout.addWidget(btn)
             self._string_buttons.append(btn)
+
+    def populate_input_devices(self):
+        devices = sd.query_devices()
+        self.inputDevice.clear()
+        default_index = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+        selected_row = 0
+        row = 0
+        for idx, dev in enumerate(devices):
+            if int(dev.get("max_input_channels", 0)) > 0:
+                name = f"{dev.get('name', 'Unknown')}"
+                self.inputDevice.addItem(name, idx)
+                if default_index == idx:
+                    selected_row = row
+                row += 1
+        self.inputDevice.setCurrentIndex(selected_row)
 
     def apply_theme(self):
         QtWidgets.QApplication.setStyle("Fusion")
@@ -414,14 +482,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(
             """
             QLabel { color: #EDEFF2; }
+            QLabel#title { font-size: 22px; font-weight: 600; color: #EDEFF2; }
             QComboBox { background:#1C1F24; padding:6px 10px; border:1px solid #2A2F36; border-radius:8px; color:#EDEFF2; }
             QProgressBar { background:#1C1F24; border:1px solid #2A2F36; border-radius:6px; height:10px; }
             QProgressBar::chunk { background-color:#22C55E; }
-            QPushButton { background:#1C1F24; padding:8px 14px; border:1px solid #2A2F36; border-radius:10px; color:#EDEFF2; }
+            QPushButton { background:#1C1F24; padding:10px 16px; border:1px solid #2A2F36; border-radius:10px; color:#EDEFF2; }
+            QPushButton#primary { background:#22C55E; color:#0B1115; border-color:#22C55E; }
+            QPushButton#primary:hover { background:#26d765; }
+            QPushButton#primary:pressed { background:#1db457; }
             QPushButton:hover { background:#22262C; }
             QPushButton:pressed { background:#171A1E; }
             QPushButton:disabled { background:#171A1E; color:#888; }
             QCheckBox { color:#EDEFF2; }
+            QPushButton[class="chip"] { padding:8px 12px; border-radius:16px; background:#15191E; }
+            QPushButton[class="chip"]:checked { background:#22303a; border-color:#395268; }
             """
         )
 
@@ -451,12 +525,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ws_thread.mode = "chromatic" if self.chromaticCheck.isChecked() else ""
         self._ws_thread.readingReceived.connect(self.gauge.setReadingState)
         self._ws_thread.start()
+        # Resolve selected input device index from combo box
+        device_index = self.inputDevice.currentData()
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
             dtype="float32",
             blocksize=BLOCK_SIZE,
             callback=self.audio_callback,
+            device=device_index if device_index is not None else None,
         )
         self._stream.start()
 
@@ -515,6 +592,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ws_thread.mode = "chromatic" if state == QtCore.Qt.Checked else ""
         self._restart_streaming_if_active()
 
+    def on_input_device_changed(self, index: int):  # noqa: ARG002
+        # Restart to apply new input device
+        self._restart_streaming_if_active()
+
     def on_string_selected(self, checked: bool, note_name: str):
         # Toggle manual lock per chip; single selection behavior
         if checked:
@@ -558,6 +639,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication([])
+    app.setFont(QtGui.QFont("Roboto", 10))
     win = MainWindow()
     win.resize(720, 420)
     win.show()
