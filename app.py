@@ -18,7 +18,7 @@ DEFAULT_PRESET = "guitar_standard"
 DEFAULT_ALGO = "yin"  # yin|acf
 DEFAULT_SMOOTH = "ema"  # none|ema|median
 DEFAULT_A4 = 440
-DEFAULT_VAD_RMS = 0.01  # ~-40 dBFS gate for silence suppression
+DEFAULT_VAD_RMS = 0.01  # fixed VAD threshold
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 2048
 
@@ -44,21 +44,22 @@ class TunerGauge(QtWidgets.QWidget):
         self.status_text = ""
         self.tooltip_text = ""
         self._ema_cents = float("nan")
-        self._ema_alpha = 0.18
+        self._ema_alpha = 0.12  # More smoothing for stability
         # Hysteresis + debounce for status stability
         self._status: str = ""
         self._pending_status: Optional[str] = None
         self._pending_since_s: float = 0.0
-        self._debounce_s: float = 0.15  # 150 ms to confirm status change
-        # Enter in-tune within ±2 cents; exit when beyond ±4 cents
-        self._hyst_in_cents: float = 2.0
-        self._hyst_out_cents: float = 4.0
+        self._debounce_s: float = 0.25  # 250 ms to confirm status change
+        # Enter in-tune within ±3 cents; exit when beyond ±6 cents
+        self._hyst_in_cents: float = 3.0
+        self._hyst_out_cents: float = 6.0
         self.setMinimumSize(560, 320)
         self._last_f0_hz: float = 0.0
         self._last_cents_off: float = float("nan")
 
     def setReadingState(self, state: PitchState):
-        self.note = state.note or state.target_note or ""
+        # Use target note for more stable display
+        self.note = state.target_note or state.note or ""
         raw_cents = state.cents_off if not math.isnan(state.cents_off) else state.cents_to_target
         # EMA smoothing on needle
         if isinstance(raw_cents, float) and not math.isnan(raw_cents):
@@ -116,11 +117,11 @@ class TunerGauge(QtWidgets.QWidget):
     def setSmoothingMode(self, mode: str):
         mode_l = (mode or "").lower()
         if mode_l == "none":
-            self._ema_alpha = 1.0  # effectively no smoothing
+            self._ema_alpha = 0.3  # Some smoothing even in "none" mode
         elif mode_l == "median":
-            self._ema_alpha = 0.2  # keep EMA mild; backend median handles most smoothing
+            self._ema_alpha = 0.15  # More smoothing for median mode
         else:  # ema
-            self._ema_alpha = 0.18
+            self._ema_alpha = 0.12  # More smoothing for stability
 
     def paintEvent(self, event: QtGui.QPaintEvent):
         p = QtGui.QPainter(self)
@@ -347,11 +348,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stopBtn.setEnabled(False)
         self.a4Box = QtWidgets.QComboBox()
         self.a4Box.addItems(["440","442"]) 
-        self.algoBox = QtWidgets.QComboBox()
-        self.algoBox.addItems(["acf","yin"]) 
+        # Algorithm is now fixed to YIN - no need for dropdown 
         self.smoothBox = QtWidgets.QComboBox()
         self.smoothBox.addItems(["none","ema","median"]) 
         self.chromaticCheck = QtWidgets.QCheckBox("Chế độ chromatic")
+        
+        # VAD is now fixed at 0.01 - no UI control needed
 
         rightCol = QtWidgets.QVBoxLayout()
         rightCol.addWidget(QtWidgets.QLabel("Điều khiển"))
@@ -360,8 +362,6 @@ class MainWindow(QtWidgets.QMainWindow):
         rightCol.addSpacing(8)
         rightCol.addWidget(QtWidgets.QLabel("A4"))
         rightCol.addWidget(self.a4Box)
-        rightCol.addWidget(QtWidgets.QLabel("Thuật toán"))
-        rightCol.addWidget(self.algoBox)
         rightCol.addWidget(QtWidgets.QLabel("Làm mượt"))
         rightCol.addWidget(self.smoothBox)
         rightCol.addWidget(self.chromaticCheck)
@@ -418,7 +418,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stopBtn.clicked.connect(self.on_stop)
         self.presetBox.currentTextChanged.connect(self.on_preset_changed)
         self.a4Box.currentTextChanged.connect(self.on_a4_changed)
-        self.algoBox.currentTextChanged.connect(self.on_algo_changed)
         self.smoothBox.currentTextChanged.connect(self.on_smooth_changed)
         self.chromaticCheck.stateChanged.connect(self.on_chromatic_changed)
         self.inputDevice.currentIndexChanged.connect(self.on_input_device_changed)
@@ -520,9 +519,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def start_streaming(self):
         self._ws_thread = WsClientThread(self.presetBox.currentText())
         self._ws_thread.a4 = int(self.a4Box.currentText())
-        self._ws_thread.algo = self.algoBox.currentText()
+        self._ws_thread.algo = "yin"  # Fixed to YIN algorithm
         self._ws_thread.smooth = self.smoothBox.currentText()
         self._ws_thread.mode = "chromatic" if self.chromaticCheck.isChecked() else ""
+        self._ws_thread.vad_rms = DEFAULT_VAD_RMS  # Fixed VAD sensitivity
         self._ws_thread.readingReceived.connect(self.gauge.setReadingState)
         self._ws_thread.start()
         # Resolve selected input device index from combo box
@@ -576,10 +576,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ws_thread.a4 = int(text)
         self._restart_streaming_if_active()
 
-    def on_algo_changed(self, text: str):
-        if self._ws_thread is not None:
-            self._ws_thread.algo = text
-        self._restart_streaming_if_active()
 
     def on_smooth_changed(self, text: str):
         if self._ws_thread is not None:
@@ -616,6 +612,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._stream is not None:
             self.stop_streaming()
             self.start_streaming()
+
 
     # Hotkeys
     def keyPressEvent(self, e: QtGui.QKeyEvent):
