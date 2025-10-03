@@ -18,7 +18,7 @@ DEFAULT_PRESET = "guitar_standard"
 DEFAULT_ALGO = "yin"  # yin|acf
 DEFAULT_SMOOTH = "ema"  # none|ema|median
 DEFAULT_A4 = 440
-DEFAULT_VAD_RMS = 0.01  # fixed VAD threshold
+DEFAULT_VAD_RMS = 0.005  # fixed VAD threshold (lower for sensitive detection)
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 2048
 
@@ -56,11 +56,16 @@ class TunerGauge(QtWidgets.QWidget):
         self.setMinimumSize(560, 320)
         self._last_f0_hz: float = 0.0
         self._last_cents_off: float = float("nan")
+        # Track whether current cents are relative to target note (manual) or chromatic
+        self._using_to_target: bool = False
 
     def setReadingState(self, state: PitchState):
         # Use target note for more stable display
         self.note = state.target_note or state.note or ""
-        raw_cents = state.cents_off if not math.isnan(state.cents_off) else state.cents_to_target
+        # Prefer cents_to_target when available (manual/preset targeting)
+        use_to_target = (isinstance(state.cents_to_target, float) and not math.isnan(state.cents_to_target))
+        raw_cents = state.cents_to_target if use_to_target else state.cents_off
+        self._using_to_target = bool(use_to_target)
         # EMA smoothing on needle
         if isinstance(raw_cents, float) and not math.isnan(raw_cents):
             if math.isnan(self._ema_cents):
@@ -93,7 +98,12 @@ class TunerGauge(QtWidgets.QWidget):
         if self._status == "In tune":
             # Stay in tune until we exit wider band
             if abs(raw_cents) > self._hyst_out_cents:
-                candidate = "Tune up" if raw_cents < 0 else "Tune down"
+                if self._using_to_target:
+                    # cents_to_target: positive -> need Tune up
+                    candidate = "Tune up" if raw_cents > 0 else "Tune down"
+                else:
+                    # chromatic cents_off: negative -> need Tune up
+                    candidate = "Tune up" if raw_cents < 0 else "Tune down"
             else:
                 candidate = "In tune"
         else:
@@ -101,7 +111,10 @@ class TunerGauge(QtWidgets.QWidget):
             if abs(raw_cents) < self._hyst_in_cents:
                 candidate = "In tune"
             else:
-                candidate = ("Tune up" if raw_cents < 0 else "Tune down")
+                if self._using_to_target:
+                    candidate = ("Tune up" if raw_cents > 0 else "Tune down")
+                else:
+                    candidate = ("Tune up" if raw_cents < 0 else "Tune down")
         if candidate != self._status:
             if self._pending_status != candidate:
                 self._pending_status = candidate
@@ -347,7 +360,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stopBtn = QtWidgets.QPushButton("Dừng")
         self.stopBtn.setEnabled(False)
         self.a4Box = QtWidgets.QComboBox()
-        self.a4Box.addItems(["440","442"]) 
+        self.a4Box.addItems(["440"]) 
+        # Default to 440 Hz
+        self.a4Box.setCurrentText("440")
         # Algorithm is now fixed to YIN - no need for dropdown 
         self.smoothBox = QtWidgets.QComboBox()
         self.smoothBox.addItems(["none","ema","median"]) 
@@ -521,7 +536,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ws_thread.a4 = int(self.a4Box.currentText())
         self._ws_thread.algo = "yin"  # Fixed to YIN algorithm
         self._ws_thread.smooth = self.smoothBox.currentText()
-        self._ws_thread.mode = "chromatic" if self.chromaticCheck.isChecked() else ""
+        # Prefer manual lock if any string chip is selected; otherwise fall back to chromatic checkbox
+        selected_manual = None
+        try:
+            for b in self._string_buttons:
+                if b.isChecked():
+                    selected_manual = b.text()
+                    break
+        except Exception:
+            selected_manual = None
+        if selected_manual:
+            self._ws_thread.mode = "manual"
+            self._ws_thread.manual_note = selected_manual
+        else:
+            self._ws_thread.mode = "chromatic" if self.chromaticCheck.isChecked() else ""
         self._ws_thread.vad_rms = DEFAULT_VAD_RMS  # Fixed VAD sensitivity
         self._ws_thread.readingReceived.connect(self.gauge.setReadingState)
         self._ws_thread.start()
